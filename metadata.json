@@ -1,0 +1,6 @@
+{
+  "name": "ShopEasy",
+  "description": "A beautiful e-commerce application with a modern UI",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
