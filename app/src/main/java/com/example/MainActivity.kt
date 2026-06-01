@@ -44,6 +44,25 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Send
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.LocalShipping
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import coil.compose.AsyncImage
 import com.example.ui.theme.MyApplicationTheme
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -152,6 +171,21 @@ class ShopViewModel : ViewModel() {
         _orders.update { it + order }
     }
 
+    fun createDemoOrder() {
+        val demoId = "DEMO-" + (10000..99999).random()
+        val demoOrder = Order(
+            id = demoId,
+            buyerName = "আয়ুশ মন্ডল (Demo Buyer)",
+            address = "সেক্টর ৫, উত্তরা, ঢাকা, বাংলাদেশ",
+            phone = "01712345678",
+            email = "mondalayush264@gmail.com",
+            items = listOf(CartItem(initialProducts[0], 1), CartItem(initialProducts[1], 1)),
+            total = initialProducts[0].price + initialProducts[1].price,
+            status = "Processing"
+        )
+        _orders.update { it + demoOrder }
+    }
+
     fun updateProductPrice(productId: String, newPrice: Double) {
         _products.update { current ->
             current.map {
@@ -171,6 +205,151 @@ class ShopViewModel : ViewModel() {
     fun updateAdminCredentials(usernameVal: String, passwordVal: String) {
         _adminUsername.value = usernameVal
         _adminPassword.value = passwordVal
+    }
+
+    private val _chatMessages = MutableStateFlow<List<ChatMessage>>(listOf(
+        ChatMessage("স্বাগতম! আমি ShopEasy AI অ্যাসিস্ট্যান্ট। আমি আপনাকে সঠিক পণ্য খুঁজে পেতে বা পছন্দমতো সাজেশন্স দিতে সাহায্য করতে পারি। (Welcome! I am your ShopEasy AI Assistant. I can help you find products, compare options, or suggest recommendations.)", false)
+    ))
+    val chatMessages: StateFlow<List<ChatMessage>> = _chatMessages.asStateFlow()
+
+    private val _isChatLoading = MutableStateFlow(false)
+    val isChatLoading: StateFlow<Boolean> = _isChatLoading.asStateFlow()
+
+    fun clearChat() {
+        _chatMessages.value = listOf(
+            ChatMessage("স্বাগতম! আমি ShopEasy AI অ্যাসিস্ট্যান্ট। আমি আপনাকে সঠিক পণ্য খুঁজে পেতে বা পছন্দমতো সাজেশন্স দিতে সাহায্য করতে পারি। (Welcome! I am your ShopEasy AI Assistant. I can help you find products, compare options, or suggest recommendations.)", false)
+        )
+    }
+
+    fun sendChatMessage(userText: String) {
+        if (userText.isBlank()) return
+        
+        val currentMessages = _chatMessages.value
+        val newMessages = currentMessages + ChatMessage(userText, true)
+        _chatMessages.value = newMessages
+        _isChatLoading.value = true
+        
+        viewModelScope.launch {
+            val productListContext = _products.value.joinToString(separator = "\n") { 
+                "- Category: ${it.category}, Product Name: ${it.name}, Price: ₹${it.price}, ID: ${it.id}, Description: ${it.description}"
+            }
+            
+            val systemInstruction = """
+                You are "ShopEasy AI Assistant", a smart and helpful shopping expert for the ShopEasy online store.
+                
+                Here is the current list of products in our inventory:
+                $productListContext
+                
+                Your Guidelines:
+                1. Always prioritize products from the provided inventory list. Identify recommendations, compare options, or answer details based on these products.
+                2. If the user asks for a specific price range, list, or category, recommend relevant items from this inventory.
+                3. Do not make up products that do not exist here.
+                4. Be friendly, helpful, and polite.
+                5. Respond in a welcoming mix of Bengali and English (Bilingual or Banglish as appropriate), or copy the language preference of the user.
+                6. Advise users that they can browse on the Home screen, click on any product card to see details, click "Add to Cart", and complete their purchase at the Checkout screen!
+            """.trimIndent()
+            
+            val promptBuilder = StringBuilder()
+            promptBuilder.append("Conversation History:\n")
+            newMessages.takeLast(8).forEach { msg ->
+                val role = if (msg.isUser) "User" else "Assistant"
+                promptBuilder.append("$role: ${msg.text}\n")
+            }
+            promptBuilder.append("\nUser: $userText\nAssistant: ")
+            
+            val reply = queryGemini(promptBuilder.toString(), systemInstruction)
+            
+            _chatMessages.update { it + ChatMessage(reply, false) }
+            _isChatLoading.value = false
+        }
+    }
+}
+
+data class ChatMessage(
+    val text: String,
+    val isUser: Boolean,
+    val timestamp: Long = System.currentTimeMillis()
+)
+
+suspend fun queryGemini(prompt: String, systemInstruction: String): String = withContext(Dispatchers.IO) {
+    val apiKey = BuildConfig.GEMINI_API_KEY
+    if (apiKey.isEmpty() || apiKey == "MY_GEMINI_API_KEY") {
+        return@withContext "Error: Gemini API key is not configured in AI Studio Secrets. Please add GEMINI_API_KEY to AI Studio Secrets."
+    }
+    
+    val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=$apiKey"
+    
+    val client = okhttp3.OkHttpClient.Builder()
+        .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
+        
+    val jsonRequest = org.json.JSONObject().apply {
+        val contentsArray = org.json.JSONArray().apply {
+            put(org.json.JSONObject().apply {
+                put("parts", org.json.JSONArray().apply {
+                    put(org.json.JSONObject().apply {
+                        put("text", prompt)
+                    })
+                })
+            })
+        }
+        put("contents", contentsArray)
+        
+        if (systemInstruction.isNotEmpty()) {
+            put("systemInstruction", org.json.JSONObject().apply {
+                put("parts", org.json.JSONArray().apply {
+                    put(org.json.JSONObject().apply {
+                        put("text", systemInstruction)
+                    })
+                })
+            })
+        }
+    }
+    
+    val mediaType = "application/json; charset=utf-8".toMediaType()
+    val body = jsonRequest.toString().toRequestBody(mediaType)
+    
+    val request = okhttp3.Request.Builder()
+        .url(url)
+        .post(body)
+        .build()
+        
+    try {
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                return@withContext "Error: Unexpected response code ${response.code} - ${response.message}"
+            }
+            val responseBodyString = response.body?.string() ?: return@withContext "Error: Empty response body"
+            val jsonResponse = org.json.JSONObject(responseBodyString)
+            val candidates = jsonResponse.optJSONArray("candidates")
+            val content = candidates?.optJSONObject(0)?.optJSONObject("content")
+            val parts = content?.optJSONArray("parts")
+            val text = parts?.optJSONObject(0)?.optString("text")
+            
+            text ?: "Error: No text in model response."
+        }
+    } catch (e: Exception) {
+        "Error: ${e.message}"
+    }
+}
+
+fun copyUriToLocalStorage(context: android.content.Context, uri: Uri): String? {
+    return try {
+        val inputStream = context.contentResolver.openInputStream(uri) ?: return null
+        val fileName = "product_${System.currentTimeMillis()}.jpg"
+        val file = java.io.File(context.filesDir, fileName)
+        val outputStream = java.io.FileOutputStream(file)
+        inputStream.use { input ->
+            outputStream.use { output ->
+                input.copyTo(output)
+            }
+        }
+        file.absolutePath
+    } catch (e: Exception) {
+        e.printStackTrace()
+        null
     }
 }
 
@@ -300,6 +479,9 @@ fun ShopApp() {
         composable("tracking") {
             TrackingScreen(navController, viewModel)
         }
+        composable("ai_assistant") {
+            AIAssistantScreen(navController, viewModel)
+        }
     }
 }
 
@@ -317,8 +499,30 @@ fun HomeScreen(navController: NavHostController, viewModel: ShopViewModel) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("ShopEasy", style = MaterialTheme.typography.titleLarge) },
+                title = {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Surface(
+                            modifier = Modifier.size(36.dp),
+                            shape = androidx.compose.foundation.shape.CircleShape,
+                            color = MaterialTheme.colorScheme.primaryContainer,
+                            border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f))
+                        ) {
+                            androidx.compose.foundation.Image(
+                                painter = androidx.compose.ui.res.painterResource(id = com.example.R.drawable.img_shopeasy_logo_1780310943705),
+                                contentDescription = "ShopEasy Logo",
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+                        Text("ShopEasy", style = MaterialTheme.typography.titleLarge)
+                    }
+                },
                 actions = {
+                    IconButton(onClick = { navController.navigate("ai_assistant") }) {
+                        Icon(Icons.Filled.AutoAwesome, contentDescription = "AI Assistant", tint = MaterialTheme.colorScheme.primary)
+                    }
                     IconButton(onClick = { navController.navigate("tracking") }) {
                         Icon(Icons.Filled.List, contentDescription = "My Orders")
                     }
@@ -376,6 +580,90 @@ fun HomeScreen(navController: NavHostController, viewModel: ShopViewModel) {
                             selectedContainerColor = MaterialTheme.colorScheme.primary,
                             selectedLabelColor = MaterialTheme.colorScheme.onPrimary
                         )
+                    )
+                }
+            }
+
+            // AI Assistant Greeting Card
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp)
+                    .clickable { navController.navigate("ai_assistant") },
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+            ) {
+                Row(
+                    modifier = Modifier.padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.AutoAwesome,
+                        contentDescription = "AI Assistant",
+                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.size(28.dp)
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "স্মার্ট শপ অ্যাসিস্ট্যান্ট (Shop AI)",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                        Text(
+                            "পণ্য খোঁজার গাইড এবং সাজেশনের জন্য AI এর সাথে চ্যাট করুন",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f)
+                        )
+                    }
+                    Text(
+                        "চ্যাট করুন →",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+
+            // Delivery Tracking Greeting Card
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp)
+                    .clickable { navController.navigate("tracking") },
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+            ) {
+                Row(
+                    modifier = Modifier.padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.LocalShipping,
+                        contentDescription = "Delivery Tracking",
+                        tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                        modifier = Modifier.size(28.dp)
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "ডেলিভারি ট্র্যাকিং (Delivery Tracking)",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer
+                        )
+                        Text(
+                            "আপনার অর্ডারের লাইভ ডেলিভারি স্ট্যাটাস ও প্রোগ্রেস চেক করুন",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.8f)
+                        )
+                    }
+                    Text(
+                        "ট্র্যাক করুন →",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.secondary
                     )
                 }
             }
@@ -529,6 +817,49 @@ fun DetailScreen(product: Product, navController: NavHostController, viewModel: 
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                Spacer(modifier = Modifier.height(24.dp))
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            viewModel.sendChatMessage("আমাকে ${product.name} সম্পর্কে আরও বলুন এবং এটি কেনার সুবিধা কী? (Tell me more about ${product.name} and why I should buy it?)")
+                            navController.navigate("ai_assistant")
+                        },
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.AutoAwesome,
+                            contentDescription = "AI Expert",
+                            tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                            modifier = Modifier.size(24.dp)
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Ask our Shop AI Expert",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                            Text(
+                                "Get instant AI insights on ${product.name}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.8f)
+                            )
+                        }
+                        Text(
+                            "→",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer
+                        )
+                    }
+                }
                 Spacer(modifier = Modifier.height(32.dp))
             }
         }
@@ -692,6 +1023,7 @@ fun CheckoutScreen(navController: NavHostController, viewModel: ShopViewModel) {
     var phone by remember { mutableStateOf(androidx.compose.ui.text.input.TextFieldValue("")) }
     var email by remember { mutableStateOf(androidx.compose.ui.text.input.TextFieldValue("")) }
     var orderPlaced by remember { mutableStateOf(false) }
+    var createdOrderId by remember { mutableStateOf("") }
 
     Scaffold(
         topBar = {
@@ -707,14 +1039,69 @@ fun CheckoutScreen(navController: NavHostController, viewModel: ShopViewModel) {
     ) { padding ->
         if (orderPlaced) {
             Box(modifier = Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("Order Placed Successfully!", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.primary)
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(24.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.LocalShipping,
+                        contentDescription = "Success",
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(64.dp)
+                    )
                     Spacer(modifier = Modifier.height(16.dp))
-                    Button(onClick = { 
-                        viewModel.clearCart()
-                        navController.popBackStack("home", false) 
-                    }) {
-                        Text("Back to Home")
+                    Text(
+                        "অর্ডার সফলভাবে সম্পন্ন হয়েছে!", 
+                        style = MaterialTheme.typography.titleLarge, 
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        "ধন্যবাদ! নিচে দেওয়া আইডি দিয়ে আপনার ডেলিভারি ট্র্যাকিং করতে পারবেন:",
+                        style = MaterialTheme.typography.bodyMedium, 
+                        color = Color.Gray,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Surface(
+                        color = MaterialTheme.colorScheme.primaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text(
+                            text = "#${createdOrderId.take(8).uppercase()}",
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(24.dp))
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(16.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        OutlinedButton(
+                            onClick = { 
+                                viewModel.clearCart()
+                                navController.popBackStack("home", false) 
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("হোমে ফিরে যান")
+                        }
+                        Button(
+                            onClick = { 
+                                viewModel.clearCart()
+                                navController.navigate("tracking") {
+                                    popUpTo("home") { saveState = true }
+                                }
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("ডেলিভারি ট্র্যাক করুন")
+                        }
                     }
                 }
             }
@@ -750,8 +1137,10 @@ fun CheckoutScreen(navController: NavHostController, viewModel: ShopViewModel) {
                     onClick = { 
                         val cart = viewModel.cartItems.value
                         val total = cart.sumOf { it.product.price * it.quantity }
+                        val orderId = java.util.UUID.randomUUID().toString()
+                        createdOrderId = orderId
                         val order = Order(
-                            id = java.util.UUID.randomUUID().toString(),
+                            id = orderId,
                             buyerName = name.text,
                             address = address.text,
                             phone = phone.text,
@@ -929,6 +1318,18 @@ fun AdminScreen(navController: NavHostController, viewModel: ShopViewModel) {
                         var newDesc by remember { mutableStateOf(androidx.compose.ui.text.input.TextFieldValue("")) }
                         var newCategory by remember { mutableStateOf(androidx.compose.ui.text.input.TextFieldValue("All")) }
                         
+                        val context = androidx.compose.ui.platform.LocalContext.current
+                        val launcher = rememberLauncherForActivityResult(
+                            contract = ActivityResultContracts.GetContent()
+                        ) { uri: Uri? ->
+                            uri?.let {
+                                val localPath = copyUriToLocalStorage(context, it)
+                                if (localPath != null) {
+                                    newImage = androidx.compose.ui.text.input.TextFieldValue("file://$localPath")
+                                }
+                            }
+                        }
+
                         Column(
                             modifier = Modifier
                                 .fillMaxSize()
@@ -945,43 +1346,116 @@ fun AdminScreen(navController: NavHostController, viewModel: ShopViewModel) {
                                 modifier = Modifier.fillMaxWidth(),
                                 keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number)
                             )
-                            OutlinedTextField(value = newImage, onValueChange = { newImage = it }, label = { Text("Image URL") }, modifier = Modifier.fillMaxWidth())
-                            if (newImage.text.isNotBlank()) {
-                                Card(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(180.dp),
-                                    shape = RoundedCornerShape(12.dp),
-                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-                                ) {
-                                    Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
-                                        AsyncImage(
-                                            model = newImage.text,
-                                            contentDescription = "New Product Image Preview",
-                                            contentScale = ContentScale.Crop,
-                                            modifier = Modifier.fillMaxSize()
-                                        )
+                            
+                            Text("Product Image (ছবি বাছুন)", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(180.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                                    .clickable { launcher.launch("image/*") },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (newImage.text.isNotBlank()) {
+                                    AsyncImage(
+                                        model = newImage.text,
+                                        contentDescription = "New Product Image Preview",
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .background(Color.Black.copy(alpha = 0.4f)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
                                         Surface(
-                                            color = Color.Black.copy(alpha = 0.6f),
-                                            shape = RoundedCornerShape(4.dp),
-                                            modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp)
+                                            color = Color.Black.copy(alpha = 0.7f),
+                                            shape = RoundedCornerShape(20.dp)
                                         ) {
-                                            Text(
-                                                "Image Preview",
-                                                color = Color.White,
-                                                style = MaterialTheme.typography.labelSmall,
-                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                            )
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Filled.Add,
+                                                    contentDescription = "Change Image",
+                                                    tint = Color.White,
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                                Text("ছবি পরিবর্তন করুন (Change Image)", color = Color.White, style = MaterialTheme.typography.labelSmall)
+                                            }
                                         }
+                                    }
+                                } else {
+                                    Column(
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Image,
+                                            contentDescription = "Upload Image",
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(40.dp)
+                                        )
+                                        Text("গ্যালারি থেকে ছবি আপলোড করুন", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                                        Text("Choose from Gallery", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
                                     }
                                 }
                             }
+
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text("অথবা ডেমো ছবি বাছুন (Or choose a demo image):", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                                Row(
+                                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    val presets = listOf(
+                                        "Shoes" to "https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=800&q=80",
+                                        "Watch" to "https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=800&q=80",
+                                        "Electronics" to "https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800&q=80",
+                                        "Furniture" to "https://images.unsplash.com/photo-1503602642458-232111445657?w=800&q=80",
+                                        "Clothes" to "https://images.unsplash.com/photo-1521572267360-ee0c2909d518?w=800&q=80",
+                                        "Grocery" to "https://images.unsplash.com/photo-1610832958506-ee5633619144?w=800&q=80"
+                                    )
+                                    presets.forEach { (label, url) ->
+                                        val isSelected = newImage.text == url
+                                        SuggestionChip(
+                                            onClick = { newImage = androidx.compose.ui.text.input.TextFieldValue(url) },
+                                            label = { Text(label) },
+                                            border = if (isSelected) androidx.compose.foundation.BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null
+                                        )
+                                    }
+                                }
+                            }
+
+                            var showUrlInput by remember { mutableStateOf(false) }
+                            TextButton(onClick = { showUrlInput = !showUrlInput }) {
+                                Text(if (showUrlInput) "ম্যানুয়াল URL ইনপুট বন্ধ করুন" else "ম্যানুয়ালি ইমেজ URL দিন (Advanced)", style = MaterialTheme.typography.labelMedium)
+                            }
+                            if (showUrlInput) {
+                                OutlinedTextField(
+                                    value = newImage,
+                                    onValueChange = { newImage = it },
+                                    label = { Text("Image URL") },
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
+
                             OutlinedTextField(value = newDesc, onValueChange = { newDesc = it }, label = { Text("Description") }, modifier = Modifier.fillMaxWidth(), minLines = 3)
                             OutlinedTextField(value = newCategory, onValueChange = { newCategory = it }, label = { Text("Category") }, modifier = Modifier.fillMaxWidth())
                             Button(
                                 onClick = {
                                     val price = newPrice.text.toDoubleOrNull()
-                                    if (newName.text.isNotBlank() && price != null && newImage.text.isNotBlank()) {
+                                    if (newName.text.isBlank()) {
+                                        android.widget.Toast.makeText(context, "দয়া করে প্রোডাক্টের নাম দিন (Please enter product name)", android.widget.Toast.LENGTH_SHORT).show()
+                                    } else if (price == null) {
+                                        android.widget.Toast.makeText(context, "দয়া করে সঠিক মূল্য লিখুন (Please enter a valid price)", android.widget.Toast.LENGTH_SHORT).show()
+                                    } else if (newImage.text.isBlank()) {
+                                        android.widget.Toast.makeText(context, "দয়া করে একটি ছবি সিলেক্ট করুন (Please select an image)", android.widget.Toast.LENGTH_SHORT).show()
+                                    } else {
                                         viewModel.addProduct(Product(
                                             id = java.util.UUID.randomUUID().toString(),
                                             name = newName.text,
@@ -995,7 +1469,7 @@ fun AdminScreen(navController: NavHostController, viewModel: ShopViewModel) {
                                         newImage = androidx.compose.ui.text.input.TextFieldValue("")
                                         newDesc = androidx.compose.ui.text.input.TextFieldValue("")
                                         newCategory = androidx.compose.ui.text.input.TextFieldValue("All")
-                                        android.widget.Toast.makeText(context, "Product Added", android.widget.Toast.LENGTH_SHORT).show()
+                                        android.widget.Toast.makeText(context, "প্রোডাক্ট সফলভাবে যোগ করা হয়েছে (Product Added successfully)", android.widget.Toast.LENGTH_SHORT).show()
                                     }
                                 },
                                 modifier = Modifier.fillMaxWidth()
@@ -1140,11 +1614,20 @@ fun AdminScreen(navController: NavHostController, viewModel: ShopViewModel) {
 @Composable
 fun TrackingScreen(navController: NavHostController, viewModel: ShopViewModel) {
     val orders by viewModel.orders.collectAsState()
+    var searchQuery by remember { mutableStateOf("") }
+    var selectedOrderForTracking by remember { mutableStateOf<Order?>(null) }
+    
+    // Automatically select the latest order as default if none selected and orders list shifts
+    LaunchedEffect(orders) {
+        if (selectedOrderForTracking == null && orders.isNotEmpty()) {
+            selectedOrderForTracking = orders.last()
+        }
+    }
     
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("অর্ডার সমূহ ও ট্র্যাকিং (My Orders)") },
+                title = { Text("ডেলিভারি ট্র্যাকিং ও অর্ডারসমূহ", fontWeight = FontWeight.Bold) },
                 navigationIcon = {
                     IconButton(onClick = { navController.popBackStack() }) {
                         Icon(Icons.Filled.ArrowBack, contentDescription = "Back")
@@ -1153,118 +1636,363 @@ fun TrackingScreen(navController: NavHostController, viewModel: ShopViewModel) {
             )
         }
     ) { padding ->
-        if (orders.isEmpty()) {
-            Box(
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .background(MaterialTheme.colorScheme.background)
+        ) {
+            // Quick search bar at top
+            Card(
                 modifier = Modifier
-                    .fillMaxSize()
-                    .padding(padding),
-                contentAlignment = Alignment.Center
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
             ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.padding(24.dp)
-                ) {
-                    Icon(
-                        Icons.Filled.List,
-                        contentDescription = null,
-                        modifier = Modifier.size(72.dp),
-                        tint = Color.Gray.copy(alpha = 0.5f)
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text(
+                        "অর্ডার আইডি দিয়ে ট্র্যাকিং করুন:",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
                     )
-                    Spacer(modifier = Modifier.height(16.dp))
-                    Text("কোনো অর্ডার পাওয়া যায়নি।", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text("আগে একটি পণ্য অর্ডার করুন!", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
-                    Spacer(modifier = Modifier.height(24.dp))
-                    Button(onClick = { navController.navigate("home") }) {
-                        Text("শপিং করতে ফিরে যান")
-                    }
-                }
-            }
-        } else {
-            LazyColumn(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(padding),
-                contentPadding = PaddingValues(16.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
-            ) {
-                items(orders.reversed()) { order ->
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(16.dp),
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-                    ) {
-                        Column(modifier = Modifier.padding(16.dp)) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column {
-                                    Text("অর্ডার আইডি: #${order.id.take(8).uppercase()}", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                                    Text("টোটাল পেমেন্ট: ₹${order.total}", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.secondary)
-                                }
-                                Surface(
-                                    color = when (order.status) {
-                                        "Pending" -> Color(0xFFFFF3CD)
-                                        "Processing" -> Color(0xFFD1ECF1)
-                                        "Shipped" -> Color(0xFFCCE5FF)
-                                        "Delivered" -> Color(0xFFD4EDDA)
-                                        else -> MaterialTheme.colorScheme.surfaceVariant
-                                    },
-                                    contentColor = when (order.status) {
-                                        "Pending" -> Color(0xFF856404)
-                                        "Processing" -> Color(0xFF0C5460)
-                                        "Shipped" -> Color(0xFF004085)
-                                        "Delivered" -> Color(0xFF155724)
-                                        else -> MaterialTheme.colorScheme.onSurfaceVariant
-                                    },
-                                    shape = RoundedCornerShape(8.dp)
-                                ) {
-                                    Text(
-                                        text = order.status,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        fontWeight = FontWeight.Bold,
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    OutlinedTextField(
+                        value = searchQuery,
+                        onValueChange = { query ->
+                            searchQuery = query
+                            val trimmed = query.trim().uppercase().removePrefix("#")
+                            if (trimmed.isNotEmpty()) {
+                                val found = orders.find { it.id.uppercase().contains(trimmed) || it.id.uppercase().take(8).contains(trimmed) }
+                                if (found != null) {
+                                    selectedOrderForTracking = found
                                 }
                             }
-                            
-                            Spacer(modifier = Modifier.height(12.dp))
-                            HorizontalDivider(thickness = 0.5.dp, color = Color.LightGray.copy(alpha = 0.5f))
-                            Spacer(modifier = Modifier.height(12.dp))
-                            
-                            Text("অর্ডার করা পণ্যসমূহ:", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
-                            Spacer(modifier = Modifier.height(8.dp))
-                            order.items.forEach { item ->
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier.padding(vertical = 4.dp)
-                                ) {
-                                    AsyncImage(
-                                        model = item.product.imageUrl,
-                                        contentDescription = null,
-                                        contentScale = ContentScale.Crop,
-                                        modifier = Modifier.size(32.dp).clip(RoundedCornerShape(4.dp))
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
+                        },
+                        placeholder = { Text("যেমন: DEMO বা অর্ডারের সংক্ষিপ্ত ID") },
+                        leadingIcon = { Icon(Icons.Filled.Search, contentDescription = "Search", tint = Color.Gray) },
+                        trailingIcon = {
+                            if (searchQuery.isNotEmpty()) {
+                                IconButton(onClick = { 
+                                    searchQuery = "" 
+                                }) {
+                                    Icon(Icons.Filled.Clear, contentDescription = "Clear", tint = Color.Gray)
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(8.dp),
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MaterialTheme.colorScheme.primary,
+                            unfocusedBorderColor = MaterialTheme.colorScheme.outline
+                        )
+                    )
+                }
+            }
+
+            if (orders.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .weight(1f),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.padding(24.dp)
+                    ) {
+                        Icon(
+                            Icons.Filled.LocalShipping,
+                            contentDescription = null,
+                            modifier = Modifier.size(72.dp),
+                            tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.4f)
+                        )
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Text(
+                            "কোনো অর্ডার পাওয়া যায়নি।", 
+                            style = MaterialTheme.typography.titleMedium, 
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            "একটি পণ্য অর্ডার করুন অথবা নিচে বাটনে ক্লিক করে একটি ডেমো অর্ডার তৈরি করুন ট্র্যাকিং দেখার জন্য!", 
+                            style = MaterialTheme.typography.bodyMedium, 
+                            color = Color.Gray,
+                            textAlign = TextAlign.Center
+                        )
+                        Spacer(modifier = Modifier.height(24.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Button(onClick = { viewModel.createDemoOrder() }) {
+                                Text("ডেমো অর্ডার তৈরি করুন")
+                            }
+                            OutlinedButton(onClick = { 
+                                navController.navigate("home") {
+                                    popUpTo("home") { inclusive = true }
+                                }
+                            }) {
+                                Text("শপিং করতে যান")
+                            }
+                        }
+                    }
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .weight(1f),
+                    contentPadding = PaddingValues(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    // 1. Live Selected tracking details
+                    selectedOrderForTracking?.let { order ->
+                        item {
+                            Card(
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(16.dp),
+                                border = androidx.compose.foundation.BorderStroke(2.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.2f)),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                            ) {
+                                Column(modifier = Modifier.padding(16.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column {
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Icon(
+                                                    Icons.Filled.LocalShipping,
+                                                    contentDescription = null,
+                                                    tint = MaterialTheme.colorScheme.primary,
+                                                    modifier = Modifier.size(20.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Text(
+                                                    text = "লাইভ ট্র্যাকার: #${order.id.take(8).uppercase()}",
+                                                    style = MaterialTheme.typography.titleMedium,
+                                                    fontWeight = FontWeight.Bold
+                                                )
+                                            }
+                                            Text(
+                                                text = "ক্রেতা: ${order.buyerName}",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = Color.Gray
+                                            )
+                                        }
+                                        
+                                        Surface(
+                                            color = when (order.status) {
+                                                "Pending" -> Color(0xFFFFF3CD)
+                                                "Processing" -> Color(0xFFD1ECF1)
+                                                "Shipped" -> Color(0xFFCCE5FF)
+                                                "Delivered" -> Color(0xFFD4EDDA)
+                                                else -> MaterialTheme.colorScheme.surfaceVariant
+                                            },
+                                            contentColor = when (order.status) {
+                                                "Pending" -> Color(0xFF856404)
+                                                "Processing" -> Color(0xFF0C5460)
+                                                "Shipped" -> Color(0xFF004085)
+                                                "Delivered" -> Color(0xFF155724)
+                                                else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                            },
+                                            shape = RoundedCornerShape(8.dp)
+                                        ) {
+                                            Text(
+                                                text = order.status,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = FontWeight.Bold,
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                            )
+                                        }
+                                    }
+                                    
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    HorizontalDivider(thickness = 0.5.dp, color = Color.LightGray.copy(alpha = 0.5f))
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    
+                                    // Tracking Carrier details
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .background(
+                                                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f),
+                                                RoundedCornerShape(8.dp)
+                                            )
+                                            .padding(12.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            Icons.Filled.Info,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Column {
+                                            Text(
+                                                text = "শিপিং পার্টনার: ShopEasy Live Express",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                            Text(
+                                                text = "সম্ভাব্য সময়: ২-৩ কার্যদিবস",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = Color.Gray
+                                            )
+                                        }
+                                    }
+                                    
+                                    Spacer(modifier = Modifier.height(16.dp))
+                                    
+                                    // Live Stepper for delivery status progress
+                                    OrderTracker(order.status)
+                                    
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    HorizontalDivider(thickness = 0.5.dp, color = Color.LightGray.copy(alpha = 0.5f))
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    
+                                    // Items details
+                                    Text("অর্ডার করা পণ্যসমূহ (${order.items.size}):", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    order.items.forEach { item ->
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            modifier = Modifier.padding(vertical = 4.dp)
+                                        ) {
+                                            AsyncImage(
+                                                model = item.product.imageUrl,
+                                                contentDescription = null,
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier.size(36.dp).clip(RoundedCornerShape(6.dp))
+                                            )
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text(
+                                                text = "${item.quantity}x ${item.product.name}",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                modifier = Modifier.weight(1f)
+                                            )
+                                            Text(
+                                                text = "₹${item.product.price * item.quantity}",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                    }
+                                    
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = "ঠিকানা: ${order.address}", 
+                                            style = MaterialTheme.typography.bodySmall, 
+                                            color = Color.Gray, 
+                                            maxLines = 1, 
+                                            overflow = TextOverflow.Ellipsis, 
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = "মোট: ₹${order.total}", 
+                                            style = MaterialTheme.typography.titleMedium, 
+                                            fontWeight = FontWeight.Bold, 
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // 2. Order History Header
+                    item {
+                        Text(
+                            text = "আপনার সকল অর্ডারসমূহ (${orders.size}):",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(top = 8.dp)
+                        )
+                    }
+                    
+                    // 3. Historical Order Cards
+                    items(orders.reversed()) { order ->
+                        val isSelected = selectedOrderForTracking?.id == order.id
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { selectedOrderForTracking = order },
+                            shape = RoundedCornerShape(12.dp),
+                            border = if (isSelected) androidx.compose.foundation.BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null,
+                            colors = CardDefaults.cardColors(
+                                containerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.2f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+                            )
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .padding(16.dp)
+                                    .fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        text = "${item.quantity}x ${item.product.name}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.weight(1f)
+                                        text = "অর্ডার আইডি: #${order.id.take(8).uppercase()}", 
+                                        style = MaterialTheme.typography.bodyMedium, 
+                                        fontWeight = FontWeight.Bold
                                     )
                                     Text(
-                                        text = "₹${item.product.price * item.quantity}",
-                                        style = MaterialTheme.typography.bodySmall,
+                                        text = "${order.items.size}টি পণ্য • ₹${order.total}", 
+                                        style = MaterialTheme.typography.bodySmall, 
+                                        color = Color.Gray
+                                    )
+                                    Text(
+                                        text = "ঠিকানা: ${order.address}", 
+                                        style = MaterialTheme.typography.labelSmall, 
+                                        color = Color.Gray, 
+                                        maxLines = 1, 
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                Column(horizontalAlignment = Alignment.End) {
+                                    Surface(
+                                        color = when (order.status) {
+                                            "Pending" -> Color(0xFFFFF3CD)
+                                            "Processing" -> Color(0xFFD1ECF1)
+                                            "Shipped" -> Color(0xFFCCE5FF)
+                                            "Delivered" -> Color(0xFFD4EDDA)
+                                            else -> MaterialTheme.colorScheme.surfaceVariant
+                                        },
+                                        contentColor = when (order.status) {
+                                            "Pending" -> Color(0xFF856404)
+                                            "Processing" -> Color(0xFF0C5460)
+                                            "Shipped" -> Color(0xFF004085)
+                                            "Delivered" -> Color(0xFF155724)
+                                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                        },
+                                        shape = RoundedCornerShape(6.dp)
+                                    ) {
+                                        Text(
+                                            text = order.status,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = "ট্র্যাক করুন →",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary,
                                         fontWeight = FontWeight.Bold
                                     )
                                 }
                             }
-                            
-                            Spacer(modifier = Modifier.height(16.dp))
-                            OrderTracker(order.status)
                         }
                     }
                 }
@@ -1342,6 +2070,196 @@ fun OrderTracker(currentStatus: String) {
                         .background(if (index < currentIndex) MaterialTheme.colorScheme.primary else Color.LightGray)
                 )
             }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AIAssistantScreen(navController: NavHostController, viewModel: ShopViewModel) {
+    val chatMessages by viewModel.chatMessages.collectAsState()
+    val isChatLoading by viewModel.isChatLoading.collectAsState()
+    var userText by remember { mutableStateOf(androidx.compose.ui.text.input.TextFieldValue("")) }
+    val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+    
+    LaunchedEffect(chatMessages.size) {
+        if (chatMessages.isNotEmpty()) {
+            listState.animateScrollToItem(chatMessages.size - 1)
+        }
+    }
+    
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Filled.AutoAwesome,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(24.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Shop AI Assistant")
+                    }
+                },
+                navigationIcon = {
+                    IconButton(onClick = { navController.popBackStack() }) {
+                        Icon(Icons.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                actions = {
+                    TextButton(onClick = { viewModel.clearChat() }) {
+                        Text("Clear Chat")
+                    }
+                }
+            )
+        },
+        bottomBar = {
+            Surface(
+                tonalElevation = 8.dp,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .imePadding()
+            ) {
+                Row(
+                    modifier = Modifier
+                        .padding(horizontal = 16.dp, vertical = 12.dp)
+                        .fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedTextField(
+                        value = userText,
+                        onValueChange = { userText = it },
+                        placeholder = { Text("এখানে লিখুন... (Type here...)") },
+                        modifier = Modifier.weight(1f),
+                        maxLines = 3,
+                        shape = RoundedCornerShape(24.dp),
+                        trailingIcon = {
+                            if (userText.text.isNotBlank() && !isChatLoading) {
+                                IconButton(onClick = {
+                                    val txt = userText.text
+                                    userText = androidx.compose.ui.text.input.TextFieldValue("")
+                                    viewModel.sendChatMessage(txt)
+                                }) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Send,
+                                        contentDescription = "Send",
+                                        tint = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                            }
+                        }
+                    )
+                    IconButton(
+                        onClick = {
+                            val txt = userText.text
+                            if (txt.isNotBlank()) {
+                                userText = androidx.compose.ui.text.input.TextFieldValue("")
+                                viewModel.sendChatMessage(txt)
+                            }
+                        },
+                        enabled = userText.text.isNotBlank() && !isChatLoading,
+                        colors = IconButtonDefaults.iconButtonColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                        ),
+                        modifier = Modifier.size(48.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Send,
+                            contentDescription = "Send"
+                        )
+                    }
+                }
+            }
+        }
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .background(MaterialTheme.colorScheme.background)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                val suggestions = listOf(
+                    "সবচেয়ে সস্তা জুতো কোনটি? (Cheapest shoes?)",
+                    "Sony Headphone সম্পর্কে বলুন",
+                    "সেরা ঘড়ি কোনটা হবে? (Best Watch?)",
+                    "সব পণ্য দেখান (Show all products)"
+                )
+                suggestions.forEach { suggestion ->
+                    SuggestionChip(
+                        onClick = {
+                            viewModel.sendChatMessage(suggestion)
+                        },
+                        label = { Text(suggestion, style = MaterialTheme.typography.labelSmall) }
+                    )
+                }
+            }
+            
+            LazyColumn(
+                state = listState,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .weight(1f),
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                items(chatMessages) { message ->
+                    ChatBubble(message)
+                }
+                if (isChatLoading) {
+                    item {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.padding(start = 12.dp).padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            Text("ShopEasy AI টাইপ করছে...", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ChatBubble(message: ChatMessage) {
+    val alignment = if (message.isUser) Alignment.End else Alignment.Start
+    val containerColor = if (message.isUser) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
+    val contentColor = if (message.isUser) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
+    val shape = if (message.isUser) {
+        RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = 16.dp, bottomEnd = 0.dp)
+    } else {
+        RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = 0.dp, bottomEnd = 16.dp)
+    }
+    
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = alignment
+    ) {
+        Surface(
+            color = containerColor,
+            contentColor = contentColor,
+            shape = shape,
+            shadowElevation = 1.dp
+        ) {
+            Text(
+                text = message.text,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
+            )
         }
     }
 }
